@@ -7,15 +7,15 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <fcntl.h>
-//#include <endian.h>
+#include <endian.h>
 #include <stdint.h>
 #include <unistd.h>
 
 #include <zlib.h>
 
-#define le32toh(foo) foo
-#define le16toh(foo) foo
-#define htole32(foo) foo
+//#define le32toh(foo) foo
+//#define le16toh(foo) foo
+//#define htole32(foo) foo
 
 struct local_file_header {
 	uint32_t signature;
@@ -154,19 +154,15 @@ static uint32_t simple_write(int fd, const char *buf, uint32_t count)
 	return out_offset;
 }
 
-int main(int argc, char *argv[])
+int flatten(const char *dstpath, const char *srcpath)
 {
-	if (argc != 3) {
-		printf("Usage: %s <zipfile> <outfile>\n", argv[0]);
+	char *src_zip = (char *)map_file(srcpath);
+	if (!src_zip) {
+		printf("Could not open zip file.\n");
 		return -1;
 	}
 
-	char *src_zip = (char *)map_file(argv[1]);
-	if (!src_zip) {
-		printf("Could not open zip file.\n");
-	}
-
-	int fd = creat(argv[2], 0777);
+	int fd = creat(dstpath, 0777);
 	if (fd == -1) {
 		printf("can't open output file\n");
 		return -1;
@@ -195,7 +191,7 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
-	memcpy(new_cdir_start, cdir_start, zip_size - cdir_offset);
+	memcpy(new_cdir_start, cdir_start, cdir_size);
 
 	uint32_t lowest_offset = find_lowest_offset(cdir_start, cdir_entries);	
 	uint32_t out_offset = simple_write(fd, src_zip, lowest_offset);
@@ -279,4 +275,14 @@ int main(int argc, char *argv[])
 	close(fd);
 
 	return 0;
+}
+
+int main(int argc, char *argv[])
+{
+	if (argc != 3) {
+		printf("Usage: %s <zipfile> <outfile>\n", argv[0]);
+		return -1;
+	}
+
+	return flatten(argv[2], argv[1]);
 }
