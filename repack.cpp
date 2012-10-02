@@ -13,9 +13,7 @@
 
 #include <zlib.h>
 
-//#define le32toh(foo) foo
-//#define le16toh(foo) foo
-//#define htole32(foo) foo
+#define TRACE(...)
 
 struct local_file_header {
 	uint32_t signature;
@@ -114,7 +112,7 @@ static void * map_file(const char *file)
 }
 
 
-static uint32_t find_lowest_offset (struct cdir_entry *entry, int count)
+static uint32_t find_lowest_offset(struct cdir_entry *entry, int count)
 {
 	uint32_t lowest_offset = zip_size;
 	while (count--) {
@@ -123,7 +121,7 @@ static uint32_t find_lowest_offset (struct cdir_entry *entry, int count)
 			lowest_offset = entry_offset;
 
 		if (le32toh(entry->signature) != 0x02014b50) {
-			printf("invalid signature on cdir_entry!\n");
+			printf("invalid signature on cdir_entry! (count=%d)\n", count);
 			exit(-1);
 		}
 
@@ -139,7 +137,7 @@ static uint32_t simple_write(int fd, const char *buf, uint32_t count)
 	while (out_offset < count) {
 		uint32_t written = write(fd, buf + out_offset,
 					 count - out_offset);
-		if (written == -1) {
+		if (written == (uint32_t)-1) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK)
 				continue;
 			else {
@@ -154,7 +152,138 @@ static uint32_t simple_write(int fd, const char *buf, uint32_t count)
 	return out_offset;
 }
 
-int flatten(const char *dstpath, const char *srcpath)
+static int
+flatten_entry(int fd,
+	      struct local_file_header *file,
+	      struct cdir_entry *current_entry,
+	      uint32_t &out_offset)
+{
+	uint32_t compressed_size = le32toh(file->compressed_size);
+	uint32_t uncompressed_size = le32toh(file->uncompressed_size);
+	current_entry->compressed_size = current_entry->uncompressed_size;
+	current_entry->offset = htole32(out_offset);
+	current_entry->compression = 0;
+
+	TRACE("writing entry for %s (%d %d)\n", current_entry->data, compressed_size, uncompressed_size);
+
+	struct local_file_header *file_copy = (struct local_file_header *)malloc(file_header_size(file));
+	if (!file_copy) {
+		printf("couldn't allocate local file header copy\n");
+		return -1;
+	}
+	memcpy(file_copy, file, file_header_size(file));
+
+	file_copy->compressed_size = file_copy->uncompressed_size;
+	file_copy->compression = 0;
+
+	out_offset += simple_write(fd, (char *)file_copy, file_header_size(file));
+	free(file_copy);
+
+	if (!file->compression) {
+		out_offset += simple_write(fd, (char *)file + file_header_size(file), le32toh(file->uncompressed_size));
+		return 0;
+	}
+
+	char *buf = (char *)malloc(uncompressed_size);
+	if (!buf) {
+		printf("failed to malloc output buffer\n");
+		return -1;
+	}
+
+	z_stream zstr;
+	memset(&zstr, 0, sizeof(zstr));
+	if (inflateInit2(&zstr, -MAX_WBITS) != Z_OK) {
+		printf("inflateInit2 failed!\n");
+		return -1;
+	}
+
+	zstr.next_in = (Bytef *)(file->data + le16toh(file->filename_size) + le16toh(file->extra_field_size));
+	zstr.avail_in = compressed_size;
+	zstr.avail_out = uncompressed_size;
+	zstr.next_out = (Bytef *)buf;
+
+	if (inflate(&zstr, Z_SYNC_FLUSH) != Z_STREAM_END &&
+                    zstr.total_out != uncompressed_size) {
+		printf("Failed to inflate everything total - %ld / %u\n", zstr.total_out, uncompressed_size);
+		return -1;
+	}
+
+	out_offset += simple_write(fd, buf, uncompressed_size);
+	free(buf);
+
+	inflateEnd(&zstr);
+	return 0;
+}
+
+static int
+squeeze_entry(int fd,
+	      struct local_file_header *file,
+	      struct cdir_entry *current_entry,
+	      uint32_t &out_offset)
+{
+	uint32_t uncompressed_size = le32toh(file->uncompressed_size);
+	if (current_entry->compression) {
+		printf("unexpected compressed entry. aborting.\n");
+		return -1;
+	}
+
+	char *buf = (char *)malloc(uncompressed_size);
+	if (!buf) {
+		printf("failed to malloc output buffer\n");
+		return -1;
+	}
+
+	z_stream zstr;
+	memset(&zstr, 0, sizeof(zstr));
+	if (deflateInit2(&zstr, 9, Z_DEFLATED, -MAX_WBITS, MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY) != Z_OK) {
+		printf("deflateInit2 failed!\n");
+		return -1;
+	}
+
+	zstr.next_in = (Bytef *)(file->data + le16toh(file->filename_size) + le16toh(file->extra_field_size));
+	zstr.avail_in = uncompressed_size;
+	zstr.avail_out = uncompressed_size;
+	zstr.next_out = (Bytef *)buf;
+
+	uint16_t compression = 8; // Deflate
+	if (deflate(&zstr, Z_FINISH) != Z_STREAM_END) {
+		compression = 0;
+	}
+
+	uint32_t compressed_size = zstr.total_out;
+	deflateEnd(&zstr);
+
+	current_entry->compressed_size = htole32(compressed_size);
+	current_entry->offset = htole32(out_offset);
+	current_entry->compression = compression;
+
+	TRACE("writing entry for %s (%d %d)\n", current_entry->data, current_entry->compressed_size, uncompressed_size);
+
+	struct local_file_header *file_copy = (struct local_file_header *)malloc(file_header_size(file));
+	if (!file_copy) {
+		printf("couldn't allocate local file header copy\n");
+		return -1;
+	}
+	memcpy(file_copy, file, file_header_size(file));
+
+	file_copy->compressed_size = htole32(compressed_size);
+	file_copy->compression = htole16(compression);
+
+	out_offset += simple_write(fd, (char *)file_copy, file_header_size(file));
+	free(file_copy);
+
+	if (!compression) {
+		out_offset += simple_write(fd, (char *)file + file_header_size(file), uncompressed_size);
+	} else {
+		out_offset += simple_write(fd, buf, compressed_size);
+	}
+
+	free(buf);
+	return 0;
+}
+
+static int
+repack(bool flatten, const char *dstpath, const char *srcpath)
 {
 	char *src_zip = (char *)map_file(srcpath);
 	if (!src_zip) {
@@ -182,12 +311,13 @@ int flatten(const char *dstpath, const char *srcpath)
 	uint16_t cdir_entries = le16toh(dirend->cdir_entries);
 	uint32_t cdir_size = le32toh(dirend->cdir_size);
 
-	printf("Found %d entries\n", cdir_entries);
+	TRACE("Found %d entries. cdir offset at %d\n",
+	      cdir_entries, cdir_offset);
 
 	struct cdir_entry *cdir_start = (struct cdir_entry *)(src_zip + cdir_offset);
 	struct cdir_entry *new_cdir_start = (struct cdir_entry *)malloc(cdir_size);
 	if (!new_cdir_start) {
-		printf("couldn't allocate central directory copy\n");
+		TRACE("couldn't allocate central directory copy\n");
 		return -1;
 	}
 
@@ -199,72 +329,29 @@ int flatten(const char *dstpath, const char *srcpath)
 	struct cdir_entry *current_entry = new_cdir_start;
 	uint16_t i = cdir_entries;
 	while (i--) {
-		struct local_file_header *file = (struct local_file_header *)(src_zip + out_offset);
-		uint32_t compressed_size = le32toh(file->compressed_size);
-		uint32_t uncompressed_size = le32toh(file->uncompressed_size);
-		current_entry->compressed_size = current_entry->uncompressed_size;
-		current_entry->offset = htole32(out_offset);
-		current_entry->compression = 0;
+		struct local_file_header *file = (struct local_file_header *)(src_zip + le32toh(current_entry->offset));
 
-		printf("writing entry for %s (%d %d)\n", current_entry->data, compressed_size, uncompressed_size);
+		int rc;
+		if (flatten)
+			rc = flatten_entry(fd, file, current_entry, out_offset);
+		else
+			rc = squeeze_entry(fd, file, current_entry, out_offset);
+		if (rc)
+			return rc;
 
-		struct local_file_header *file_copy = (struct local_file_header *)malloc(file_header_size(file));
-		if (!file_copy) {
-			printf("couldn't allocate local file header copy\n");
-			return -1;
-		}
-		memcpy(file_copy, file, file_header_size(file));
-
-		file_copy->compressed_size = file_copy->uncompressed_size;
-		file_copy->compression = 0;
-
-		out_offset += simple_write(fd, (char *)file_copy, file_header_size(file));
-		free(file_copy);
-
-		if (!file->compression) {
-			out_offset += simple_write(fd, (char *)file + file_header_size(file), le32toh(file->uncompressed_size));
-			current_entry = (struct cdir_entry *)((char *)current_entry + cdir_entry_size(current_entry));
-			continue;
-		}
-
-		z_stream zstr;
-		memset(&zstr, 0, sizeof(zstr));
-		if (inflateInit2(&zstr, -MAX_WBITS) != Z_OK) {
-			printf("inflateInit2 failed!\n");
-			return -1;
-		}
-
-		char *buf = (char *)malloc(uncompressed_size);
-		if (!buf) {
-			printf("failed to malloc output buffer\n");
-			return -1;
-		}
-
-		zstr.next_in = (Bytef *)(file->data + le16toh(file->filename_size) + le16toh(file->extra_field_size));
-		zstr.avail_in = compressed_size;
-		zstr.avail_out = uncompressed_size;
-		zstr.next_out = (Bytef *)buf;
-
-		if (inflate(&zstr, Z_SYNC_FLUSH) != Z_STREAM_END &&
-                    zstr.total_out != uncompressed_size) {
-			printf("Failed to inflate everything (%d/%d) total - %ld / %ld\n", cdir_entries - i, cdir_entries, zstr.total_out, uncompressed_size);
-			return -1;
-		}
-
-		out_offset += le32toh(file->compressed_size);
-		simple_write(fd, buf, le32toh(file->uncompressed_size));
 		current_entry = (struct cdir_entry *)((char *)current_entry + cdir_entry_size(current_entry));
-		free(buf);
 	}
 
 	uint32_t new_cdir_offset;
 	if (cdir_offset < lowest_offset) {
+		TRACE("Doing in place cdir replacement at %d\n", cdir_offset);
 		new_cdir_offset = cdir_offset;
 		lseek(fd, SEEK_SET, cdir_offset);
 		simple_write(fd, (char *)new_cdir_start, cdir_size);
 		lseek(fd, SEEK_END, 0);
 	} else {
 		new_cdir_offset = out_offset;
+		TRACE("Appending cdir at %d\n", new_cdir_offset);
 		simple_write(fd, (char *)new_cdir_start, cdir_size);
 	}
 
@@ -273,16 +360,17 @@ int flatten(const char *dstpath, const char *srcpath)
 	end.cdir_offset = htole32(new_cdir_offset);
 	simple_write(fd, (char *)&end, sizeof(end));
 	close(fd);
+	munmap(src_zip, zip_size);
 
 	return 0;
 }
 
-int main(int argc, char *argv[])
+int flatten(const char *dstpath, const char *srcpath)
 {
-	if (argc != 3) {
-		printf("Usage: %s <zipfile> <outfile>\n", argv[0]);
-		return -1;
-	}
+	return repack(true, dstpath, srcpath);
+}
 
-	return flatten(argv[2], argv[1]);
+int squeeze(const char *dstpath, const char *srcpath)
+{
+	return repack(false, dstpath, srcpath);
 }
